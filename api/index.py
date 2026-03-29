@@ -1,6 +1,7 @@
 import os
-import psycopg2
-from datetime import datetime, timezone
+import ssl
+from urllib.parse import urlparse
+import pg8000.native
 from fastapi import FastAPI, Query
 from fastapi.responses import HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -13,43 +14,50 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 # Neon Postgres helpers
 # ---------------------------------------------------------------------------
 
-def get_conn():
-    """Return a new psycopg2 connection using DATABASE_URL env var."""
+def get_conn() -> pg8000.native.Connection:
+    """Return a new pg8000 connection using DATABASE_URL env var."""
     url = os.environ.get("DATABASE_URL")
     if not url:
         raise RuntimeError("DATABASE_URL is not set")
-    return psycopg2.connect(url, sslmode="require")
+    p = urlparse(url)
+    ctx = ssl.create_default_context()
+    return pg8000.native.Connection(
+        user=p.username,
+        password=p.password,
+        host=p.hostname,
+        port=p.port or 5432,
+        database=p.path.lstrip("/"),
+        ssl_context=ctx,
+    )
 
 
 def ensure_table():
     """Create calc_logs table if it doesn't exist."""
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS calc_logs (
-                    id        SERIAL PRIMARY KEY,
-                    ts        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                    a         FLOAT NOT NULL,
-                    b         FLOAT NOT NULL,
-                    op        TEXT NOT NULL,
-                    result    FLOAT,
-                    error     TEXT
-                )
-            """)
-        conn.commit()
+    conn = get_conn()
+    conn.run("""
+        CREATE TABLE IF NOT EXISTS calc_logs (
+            id        SERIAL PRIMARY KEY,
+            ts        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            a         FLOAT NOT NULL,
+            b         FLOAT NOT NULL,
+            op        TEXT NOT NULL,
+            result    FLOAT,
+            error     TEXT
+        )
+    """)
+    conn.close()
 
 
 def insert_log(a: float, b: float, op: str, result: float | None, error: str | None):
     """Insert one row into calc_logs. Silently swallows DB errors so the
     calculator keeps working even if Neon is unreachable."""
     try:
-        with get_conn() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    "INSERT INTO calc_logs (a, b, op, result, error) VALUES (%s, %s, %s, %s, %s)",
-                    (a, b, op, result, error),
-                )
-            conn.commit()
+        conn = get_conn()
+        conn.run(
+            "INSERT INTO calc_logs (a, b, op, result, error) VALUES (:a, :b, :op, :result, :error)",
+            a=a, b=b, op=op, result=result, error=error,
+        )
+        conn.close()
     except Exception as exc:
         print(f"[log] DB insert failed: {exc}")
 
@@ -128,13 +136,12 @@ def logs(limit: int = Query(20, ge=1, le=100)):
     """Return the most recent calc_logs rows (demo endpoint)."""
     try:
         ensure_table()
-        with get_conn() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    "SELECT id, ts, a, b, op, result, error FROM calc_logs ORDER BY id DESC LIMIT %s",
-                    (limit,),
-                )
-                rows = cur.fetchall()
+        conn = get_conn()
+        rows = conn.run(
+            "SELECT id, ts, a, b, op, result, error FROM calc_logs ORDER BY id DESC LIMIT :limit",
+            limit=limit,
+        )
+        conn.close()
         return [
             {"id": r[0], "ts": r[1].isoformat(), "a": r[2], "b": r[3],
              "op": r[4], "result": r[5], "error": r[6]}
