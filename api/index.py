@@ -1,3 +1,6 @@
+import os
+import psycopg2
+from datetime import datetime, timezone
 from fastapi import FastAPI, Query
 from fastapi.responses import HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -5,6 +8,55 @@ from fastapi.middleware.cors import CORSMiddleware
 app = FastAPI()
 
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+
+# ---------------------------------------------------------------------------
+# Neon Postgres helpers
+# ---------------------------------------------------------------------------
+
+def get_conn():
+    """Return a new psycopg2 connection using DATABASE_URL env var."""
+    url = os.environ.get("DATABASE_URL")
+    if not url:
+        raise RuntimeError("DATABASE_URL is not set")
+    return psycopg2.connect(url, sslmode="require")
+
+
+def ensure_table():
+    """Create calc_logs table if it doesn't exist."""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS calc_logs (
+                    id        SERIAL PRIMARY KEY,
+                    ts        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    a         FLOAT NOT NULL,
+                    b         FLOAT NOT NULL,
+                    op        TEXT NOT NULL,
+                    result    FLOAT,
+                    error     TEXT
+                )
+            """)
+        conn.commit()
+
+
+def insert_log(a: float, b: float, op: str, result: float | None, error: str | None):
+    """Insert one row into calc_logs. Silently swallows DB errors so the
+    calculator keeps working even if Neon is unreachable."""
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO calc_logs (a, b, op, result, error) VALUES (%s, %s, %s, %s, %s)",
+                    (a, b, op, result, error),
+                )
+            conn.commit()
+    except Exception as exc:
+        print(f"[log] DB insert failed: {exc}")
+
+
+# ---------------------------------------------------------------------------
+# HTML (unchanged)
+# ---------------------------------------------------------------------------
 
 HTML = """<!DOCTYPE html>
 <html lang="ko">
@@ -41,9 +93,15 @@ HTML = """<!DOCTYPE html>
 </body>
 </html>"""
 
+
+# ---------------------------------------------------------------------------
+# Routes
+# ---------------------------------------------------------------------------
+
 @app.get("/", response_class=HTMLResponse)
 def index():
     return HTML
+
 
 @app.get("/api/calc")
 def calc(a: float = Query(...), b: float = Query(...), op: str = Query("add")):
@@ -54,7 +112,43 @@ def calc(a: float = Query(...), b: float = Query(...), op: str = Query("add")):
         "div": a / b if b != 0 else None,
     }
     if op not in ops:
+        insert_log(a, b, op, None, "invalid operator")
         return {"error": "invalid operator"}
     if ops[op] is None:
+        insert_log(a, b, op, None, "division by zero")
         return {"error": "division by zero"}
-    return {"result": ops[op]}
+
+    result = ops[op]
+    insert_log(a, b, op, result, None)
+    return {"result": result}
+
+
+@app.get("/api/logs")
+def logs(limit: int = Query(20, ge=1, le=100)):
+    """Return the most recent calc_logs rows (demo endpoint)."""
+    try:
+        ensure_table()
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT id, ts, a, b, op, result, error FROM calc_logs ORDER BY id DESC LIMIT %s",
+                    (limit,),
+                )
+                rows = cur.fetchall()
+        return [
+            {"id": r[0], "ts": r[1].isoformat(), "a": r[2], "b": r[3],
+             "op": r[4], "result": r[5], "error": r[6]}
+            for r in rows
+        ]
+    except Exception as exc:
+        return {"error": str(exc)}
+
+
+@app.post("/api/init-db")
+def init_db():
+    """One-time endpoint to create the calc_logs table."""
+    try:
+        ensure_table()
+        return {"ok": True, "message": "calc_logs table is ready"}
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
