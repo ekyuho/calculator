@@ -131,7 +131,7 @@ def calc(a: float = Query(...), b: float = Query(...), op: str = Query("add")):
     return {"result": result}
 
 
-@app.get("/api/logs")
+@app.get("/api/log")
 def logs(limit: int = Query(20, ge=1, le=100)):
     """Return the most recent calc_logs rows (demo endpoint)."""
     try:
